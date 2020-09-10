@@ -69,7 +69,35 @@ def pull(cli):
    # Done.
    ch.INFO("done")
 
+def push(cli):
+   ch.dependencies_check()
+   dlcache = cli.storage + "/dlcache"
+   if (cli.local_image_dir is not None):
+      image_dir = cli.local_image_dir
+   else:
+      image_dir = cli.storage + "/img"
+   # Stage upload.
+   image_ref = ch.Image_Ref(cli.local_image_ref)
+   image_manifest = str(image_ref) + ".manifest.json"
+   image_path = os.path.join(image_dir, image_ref.for_path)
+   if (not os.path.isdir(image_path)):
+      ch.FATAL("local image '%s' not found" % image_path)
+   # FIXME: If we have an existing manifest, we should use it.
+   if (os.path.isfile(os.path.join(dlcache, image_manifest))):
+      ch.FATAL("FIXME: local image manifest '%s%s' found; use it?"
+               % (dlcache, image_manifest))
+   if (cli.dest_image_ref):
+      dest_image_ref = ch.Image_Ref(cli.dest_image_ref)
+      dest_image_ref.defaults_add()
+   else:
+      dest_image_ref = image_ref
+   dest_image_ref.defaults_add()
+   ch.INFO("pushing image:   %s" % image_ref)
+   ch.INFO("destination:     https://%s" % dest_image_ref)
+   upload = ch.Image_Upload(image_path, dest_image_ref)
+   upload.archive_image(image_path, dlcache)
+   upload.push_to_repo()
+
 def storage_path(cli):
    print(cli.storage)
-
 

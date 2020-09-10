@@ -3,9 +3,12 @@ import atexit
 import collections
 import copy
 import datetime
+import gzip
+import hashlib
 import http.client
 import json
 import os
+import pathlib
 import getpass
 import re
 import shutil
@@ -13,6 +16,8 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
+import tempfile
 import types
 
 
@@ -230,7 +235,7 @@ class Image:
          cache are skipped; if use_cache is False, download them anyway,
          overwriting what's in the cache."""
       # Spec: https://docs.docker.com/registry/spec/manifest-v2-2/
-      dl = Repo_Downloader(self.ref)
+      dl = Repo_Data_Transfer(self.ref)
       DEBUG("downloading image: %s" % dl.ref)
       mkdirs(self.download_cache)
       # manifest
@@ -464,6 +469,170 @@ nogroup:x:65534:
       self.unpack_create_ok()
       mkdirs(self.unpack_path)
 
+
+class Image_Upload():
+   """Image Upload object.
+
+      path                  local path to image in storage
+      ref                   remote repository reference
+      layers                dictionary where keys are a layer's uncompressed
+                            archive sha256hex digest and the value is a list
+                            consisting of: 1) the uncompressed archive size, and
+                            2) the path to the compressed arhcive.
+      manifest              generated manifest to push to remote repository
+   """
+   __slots__ = ("path",
+                "ref",
+                "url",
+                "uuid",
+                "layers",
+                "manifest")
+
+   def __init__(self, path, dest,):
+      self.path = path
+      self.ref = dest
+      #self.layers = None
+      self.manifest = None
+
+   def archive_fixup(self, tarinfo):
+      # FIXME: The uid and gid of "nobody" is not always  65534. The files
+      #        files should be mapped to 0/0 with the following restrictions:
+      #           1. no leading '/'
+      #           2. no setuid or setguid files
+      tarinfo.uid = tarinfo.gid = 65534
+      tarinfo.uname = "nobody"
+      tarinfo.gname = "nogroup"
+      return tarinfo
+
+   def archive_image(self, image, dlcache):
+      "Convert image to a tar archive"
+      INFO("converting image to archive ...")
+      name = image.split('/')[-1]
+      fp = os.path.join(dlcache, name) + '.tar'
+      DEBUG('archiving %s to %s' % (image, fp))
+      if os.path.isfile(fp):
+         os.remove(fp)
+      size = None
+      # Generate uncompressed archive for digest.
+      with tarfile.open(fp, "w") as archive:
+         archive.add(self.path, arcname='', recursive=True,
+                     filter=self.archive_fixup)
+         digest = self.get_layer_hash(fp)
+         tar = dlcache + '/' + digest + '.tar'
+         os.rename(fp, tar)
+      size = pathlib.Path(tar).stat().st_size
+#      # Compress archive for uploading.
+#      tar_gz = tar + '.gz'
+#      with open(tar, "rb") as archive:
+#         with gzip.open(tar_gz, 'wb') as compressed_archive:
+#            INFO("compressing archive ...")
+#            DEBUG("compressing %s ..." % tar_gz)
+#            compressed_archive.writelines(archive)
+#      if (not os.path.isfile(tar_gz)):
+#         FATAL('failed to create compressed archive %s'
+#               % tar_gz)
+#      if (not size or size == 0):
+#         FATAL("invalid tar archive size: %s" % size)
+#      self.layers = {digest: [size, tar_gz]}
+      self.layers = {digest: [size, tar]}
+
+   def get_layer_hash(self, archive):
+      with open(archive,"rb") as f:
+            encode = hashlib.sha256(f.read()).hexdigest()
+      DEBUG("uncompressed archive hash: %s " % encode)
+      return encode
+
+   def generate_manifest(self):
+      INFO("generating schema v2 manifest")
+      manifest = {"schemaVersion": 2,
+                  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                  "config": {},
+                  "layers": []}
+      archive_media = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+      for k,v in self.layers.items():
+         manifest['layers'].append({'mediaType': archive_media,
+                                 'size': v[0],
+                                 'digest': str('sha256:%s' % k)})
+      json_dump = json.dumps(manifest)
+      manifest_json = json.loads(json_dump)
+      self.manifest = manifest_json
+      DEBUG("manfiest contents:\n%s" % json.dumps(manifest, indent=4))
+
+   def layer_exists(self, upload, digest, auth=None):
+      """Determine if a layer already exists in a repo"""
+      res = upload.head_layer(digest, auth=auth)
+      if (res.status_code == 200):
+         return True
+      return False
+
+   def upload_progress(self, url, upload, size):
+      res = upload.get_raw(url, headers={'Host': upload.ref.host },
+                           expected_statuses=(204,200,))
+      return res.headers['Range'].split('-')[-1]
+
+   def push_to_repo(self):
+      INFO('initiating upload')
+      self.generate_manifest()
+      ul = Repo_Data_Transfer(self.ref)
+      repo_d = ul.post_handshake()
+      self.url = repo_d['location'] # upload URL changes after each chunk
+      self.uuid = repo_d['uuid']
+
+      for sha256hex in self.layers:
+         digest = "sha256:%s" % sha256hex
+         if(self.layer_exists(ul, digest, auth=ul.auth)):
+            INFO("layer %s already exists" % digest)
+         else:
+            path = self.layers[sha256hex][1]       # compressed archive path
+            size = str(self.layers[sha256hex][0])  # compressed archive size
+            with open(path, "rb") as f:
+               chunk_size = 32768
+               bytes_read = 0
+               range_ = None
+               while (bytes_read <= (int(size) - chunk_size)):
+#               while (bytes_read != int(size)):
+                  data = f.read(chunk_size)
+                  if not range_:
+                     range_ = "0-%s" % (chunk_size - 1)
+                  else:
+                     range_ = "%s-%s" % (bytes_read, bytes_read + len(data) - 1)
+                  bytes_read += len(data)
+                  res = ul.patch_chunk(self.url, len(data), range_, data)
+                  DEBUG("uploaded %d/%s bytes" % (bytes_read, size))
+                  self.url = res.headers['Location']
+
+               # The final chunk has to be a PUT.
+               data = f.read()
+               range_ = "%s-%s" % (bytes_read, bytes_read + len(data) -1)
+
+               #PUT /v2/<name>/blobs/uploads/<uuid>?digest=<digest>
+               #Content-Length: <size of chunk>
+               #Content-Range: <start of range>-<end of range>
+               #Content-Type: application/octet-stream
+               #<Layer Binary Data>
+               headers={'Content-Length': str(len(data)),
+                        'Content-Range': str(range_),
+                        'Content-Type': 'application/octet-stream',
+                        'Docker-Content-Digest': digest}
+
+               # Try complete with Location URL with no digest parameter.
+               DEBUG(self.url)
+               res= ul.session.put(self.url, auth=ul.auth, headers=headers, data=data)
+               DEBUG(res.content)
+
+               # Try to complete with the URL as specified on API.
+               url = ul._url_of("blobs", "uploads/%s?digest=%s" % (self.uuid, digest))
+               DEBUG(url)
+               res = ul.session.put(url, auth=ul.auth, headers=headers, data=data)
+
+               # Try to complete with the Location URL with digest parameter
+               # appended.
+               url = "%s?digest=%s" % (self.url, digest)
+               DEBUG(url)
+               res = ul.session.put(url, auth=ul.auth, headers=headers, data=data)
+               sys.exit(0)
+
+
 class Image_Ref:
    """Reference to an image in a remote repository.
 
@@ -618,8 +787,8 @@ fields:
          self.path.insert(0, self.host)
          self.host = None
 
-class Repo_Downloader:
-   """Downloads layers and manifests from an image repository via HTTPS.
+class Repo_Data_Transfer:
+   """Transfers image data to and from a remote image repository via HTTPS.
 
       Note that with some registries, authentication is required even for
       anonymous downloads of public images. In this case, we just fetch an
@@ -669,14 +838,21 @@ class Repo_Downloader:
       url_base = "https://%s:%d/v2" % (self.ref.host, self.ref.port)
       return "/".join((url_base, self.ref.path_full, type_, address))
 
-   def authenticate_maybe(self, url):
+   def authenticate_maybe(self, url, request):
       """If we need to authenticate, do so using the 401 from url; otherwise
          do nothing."""
       if (self.auth is None):
          DEBUG("requesting auth parameters")
-         res = self.get_raw(url, expected_statuses=(401,200))
+         # FIXME: Has to be a more pythonic or OO way to alter this function
+         #        based on a get or post.
+         if (request == 'get'):
+            res = self.get_raw(url, expected_statuses=(401,200))
+         elif (request == 'post'):
+            res = self.post_raw(url, expected_statuses=(401,200))
+         else:
+            FATAL('invalid http request %s', request)
          if (res.status_code == 200):
-            self.auth = self.Null_Auth()
+            self.auth = self.Null_Auth()
          else:
             if ("WWW-Authenticate" not in res.headers):
                FATAL("WWW-Authenticate header not found")
@@ -723,7 +899,7 @@ class Repo_Downloader:
          and write the body of the response to path."""
       DEBUG("GETting: %s" % url)
       self.session_init_maybe()
-      self.authenticate_maybe(url)
+      self.authenticate_maybe(url, 'get')
       res = self.get_raw(url, headers)
       try:
          fp = open_(path, "wb")
@@ -762,6 +938,97 @@ class Repo_Downloader:
       except requests.exceptions.RequestException as x:
          FATAL("HTTP GET failed: %s" % x)
       return res
+
+   def head_layer(self, digest, auth=None):
+      """Check if a layer already exists in the repository."""
+      url = self._url_of("blobs", digest)
+      return self.session.head(url, auth=auth)
+
+   def patch_chunk(self, url, size, range_=None, data=None):
+      headers = {'Content-Length': "%s" % size,
+                 'Content-Range': "%s" % range_,
+                 'Content-Type': "application/octet-stream"}
+      return self.patch(url, headers=headers, data=data)
+
+   def patch(self, url, headers=dict(), data=None):
+      DEBUG("PATCHing: %s" % url)
+      return self.patch_raw(url, headers=headers, data=data)
+
+   def post(self, url, headers=dict()):
+      """POST url, passing headers, including athentication and session magic."""
+      DEBUG("POSTing: %s" % url)
+      self.session_init_maybe()
+      self.authenticate_maybe(url, 'post')
+      res = self.post_raw(url, headers)
+      return res
+
+   def post_handshake(self):
+      """Initiate image push. Return a dict of header information to be used
+         in the layer push, check, and confimation stages"""
+
+      # FIXME: This klduge is significant. We append "/" to the post
+      #        URL avoid a 301 redirect response from the target registry. The
+      #        301 redirect response causes our session object to submit a GET
+      #        (not POST) request to the redirected URL. The GET request returns
+      #        a header with the "pull" scope, which is insufficient for
+      #        pushing. Note our grammar doesn't allow a IMAGE_REF to end with
+      #        a '/'.
+      # v2/<name>/blobs/uploads/
+      url = self._url_of("blobs", "uploads/")
+      res = self.post(url)
+      if (res.status_code != 202):
+         FATAL("push init: expected 202 but recieved %s" % res.status_code)
+      return {'uuid': res.headers['Docker-Upload-Uuid'],
+              'location': res.headers['Location']}
+
+   def patch_raw(self, url, headers=dict(), auth=None,
+                expected_statuses=(202,416,), **kwargs):
+      """PATCH url, passing headers, with no magic. If auth is None, use
+         self.auth (which might also be None). If status is not in
+         expected_statuses, barf with a fatal error. Pass kwargs unchanged to
+         requests.session.get()."""
+      # FIXME: This function is identical to get_raw with the exception of the
+      #        expected status 202, the session.post method, and error message.
+      if (auth is None):
+         auth = self.auth
+      try:
+         res = self.session.patch(url, headers=headers, auth=auth, **kwargs)
+         if (res.status_code not in expected_statuses):
+            FATAL("HTTP PATCH failed; expected status %s but got %d: %s"
+                  % (" or ".join(str(i) for i in expected_statuses),
+                     res.status_code, res.reason))
+      except requests.exceptions.RequestException as x:
+         FATAL("HTTP PATCH failed: %s" % x)
+      return res
+
+
+   def post_raw(self, url, headers=dict(), auth=None,
+                expected_statuses=(200,202,), **kwargs):
+      """POST url, passing headers, with no magic. If auth is None, use
+         self.auth (which might also be None). If status is not in
+         expected_statuses, barf with a fatal error. Pass kwargs unchanged to
+         requests.session.get()."""
+      # FIXME: This function is identical to get_raw with the exception of the
+      #        expected status 202, the session.post method, and error message.
+      if (auth is None):
+         auth = self.auth
+      try:
+         res = self.session.post(url, headers=headers, auth=auth, **kwargs)
+         if (res.status_code not in expected_statuses):
+            FATAL("HTTP GET failed; expected status %s but got %d: %s"
+                  % (" or ".join(str(i) for i in expected_statuses),
+                     res.status_code, res.reason))
+      except requests.exceptions.RequestException as x:
+         FATAL("HTTP POST failed: %s" % x)
+      return res
+
+   def put(self, url, headers=dict()):
+      # FIXME: place holder.
+      pass
+
+   def put_layer(self, url, auth=None, headers=dict(), data=None):
+      DEBUG("put layer")
+      res = self.session.put(url, auth=auth, headers=headers, data=data)
 
    def session_init_maybe(self):
       "Initialize session if it's not initialized; otherwise do nothing."
